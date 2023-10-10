@@ -26,3 +26,6 @@ vit_large_patch32_384: (这个更大，没试过)
     normalization: vit
 
 
+# loss
+
+![图片](https://github.com/gg22mm/transformer-vit-seg/assets/6648329/f4271d7a-d478-4e97-8c47-6e7087667ffc)
