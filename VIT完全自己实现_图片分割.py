@@ -61,7 +61,7 @@ test_images[:6],test_anno[:6] #看了一下对得上
 
 # 数据增强方法转换，下面调用此方法，先定义数据增强方法
 transform = transforms.Compose([
-                    transforms.Resize((224, 224)),
+                    transforms.Resize((384, 384)), #transforms.Resize((224, 224))
                     transforms.ToTensor(),
 ])
 class Mydataset(data.Dataset):
@@ -246,7 +246,7 @@ def unpadding(y, target_size):
 
 # 投影 - 解码
 class Mlp_Head(nn.Module):
-    def __init__(self, hidden_dim, num_class, dropout) -> None:
+    def __init__(self, hidden_dim, num_class, dropout,image_height,image_width) -> None:
         super().__init__()
         # self.net = nn.Sequential(
         #     Rearrange('b n l -> b (n l)'),
@@ -254,12 +254,18 @@ class Mlp_Head(nn.Module):
         #     nn.Dropout(dropout)
         # )
 
+        # 通过vit创建模型时传过来的参数
         self.n_cls=num_class
-        self.proj_dec = nn.Linear(192, hidden_dim) #进来后，统一改成 hidden_dim
+        self.image_height=image_height
+        self.image_width=image_width
+        # 新生成的解码层
+        self.proj_dec = nn.Linear(hidden_dim, hidden_dim) #self.proj_dec = nn.Linear(192, hidden_dim) #进来后，统一改成 hidden_dim
         self.cls_emb = nn.Parameter(torch.randn(1, num_class, hidden_dim))                           #self.cls_emb = nn.Parameter(torch.randn(1, n_cls, dim))
         self.proj_patch = nn.Parameter(hidden_dim ** -0.5 * torch.randn(hidden_dim, hidden_dim))     #self.proj_patch = nn.Parameter(dim ** -0.5 * torch.randn(dim, dim))
         self.proj_classes = nn.Parameter(hidden_dim ** -0.5 * torch.randn(hidden_dim, hidden_dim))   #self.proj_classes = nn.Parameter(dim ** -0.5 * torch.randn(dim, dim))        
         self.mask_norm = nn.LayerNorm(num_class)                                                     #self.mask_norm = nn.LayerNorm(n_cls)
+
+        # self.last = nn.Conv2d(2, 2, kernel_size=1) #最后的输出层是1*1的卷积，2个卷积盒
         
 
     def forward(self, x):        
@@ -312,16 +318,38 @@ class Mlp_Head(nn.Module):
         #2、有上面的masks才能用下面的
 
         # 原来通过这个加一维的 - 224 这个配置要与图片尺寸保持一样
-        image_height=224
-        image_width=224
+        image_height=self.image_height #384 #224
+        image_width=self.image_width #384 #224
         masks = F.interpolate(masks, size=(image_height, image_width), mode="bilinear")       
         masks = unpadding(masks, (image_height, image_width))
         # print('masks22:',masks.shape) #torch.Size([8, 150, 14, 14])   ， 现  torch.Size([8, 2, 224, 224])
         # exit() 
-
+        
         return  masks
 
+        # x = self.last(masks)                        # 256*256*3
+        # return  x
 
+
+'''
+vit_large_patch16_384: (占用显存：12GB / Max 15.9GB , bs=8 ，  要达到0.4B这个才有效果)
+    image_size: 384
+    patch_size: 16
+    d_model: 1024
+    n_heads: 16
+    n_layers: 24
+    normalization: vit
+
+
+vit_large_patch32_384: (这个更大，没试过)
+    image_size: 384
+    patch_size: 32
+    d_model: 1024
+    n_heads: 16
+    n_layers: 24
+    normalization: vit
+
+'''
 # 编码
 class VIT(nn.Module):
     
@@ -329,9 +357,9 @@ class VIT(nn.Module):
 
         super().__init__()
 
-        # 图片 transforms.Resize 尺寸对应
-        image_height=224
-        image_width=224 
+        # 图片 transforms.Resize 尺寸对应 - 与上面图片数据集 尺寸要对应
+        image_height=384 #224
+        image_width=384  #224 
 
         # Transformer 切成的图片尺寸
         patch_height=16
@@ -341,10 +369,10 @@ class VIT(nn.Module):
         in_channels=3
 
         # 
-        dim=192 #改成与v2一样
-        n_head=8
+        dim=1024  #192 #改成与v2一样
+        n_head=16 #8
         p=0.1
-        n_layers=5
+        n_layers=24 #5
         
         
         # 整除操作 - 
@@ -382,7 +410,7 @@ class VIT(nn.Module):
         self.encoder = Encoder(dim, n_head, p, n_layers)#dim=64
         
         # 投影
-        self.mlp = Mlp_Head(hidden_dim=dim, num_class=2, dropout=p) #dim=64
+        self.mlp = Mlp_Head(hidden_dim=dim, num_class=2, dropout=p,image_height=image_height,image_width=image_width) #dim=64
 
 
     def forward(self, x):
@@ -433,87 +461,86 @@ class VIT(nn.Module):
 
         return x
 
-
-
-
-# 预训练
+# 训练
 device = 'cpu'
-epoches=60
+epochs=40
 model = VIT()
 model.to(device)
 
-
-# 定义交叉熵损失函数和优化器
-Loss = []
 loss_fn = nn.CrossEntropyLoss()
-opt = optim.AdamW(model.parameters(), lr=0.005)
+opt = torch.optim.Adam(model.parameters(), lr=0.0001)
+exp_lr_scheduler = lr_scheduler.StepLR(opt, step_size=70, gamma=0.00001)
 
-# 模型训练
-for epoch in range(epoches):
-    train_loss = []
-    predict = []
-    image_label = []
-
-    for x, y in trainRow:
-        x=x.to(device)
-        y=y.to(device)
-        
-        # print('输入x：',x.shape) #torch.Size([8, 3, 224, 224])
-        # print('输入y：',y.shape) #torch.Size([8, 224, 224])
-
-        y_pred = model(x)            #预测结果
-
-        # print('y_pred：',y_pred.shape) #torch.Size([8, 2, 224, 224])
-
-        loss = loss_fn(y_pred, y)   #预测值，真实值          
-        opt.zero_grad()             #默认梯度为0
-        loss.backward()             #损失反向传播放        
-        opt.step()                  #优化模型
-        
-        # 损失
-        train_loss.append(loss.detach().cpu().item())
-
-        # # 网络预测
-        # predict.extend(y_pred.argmax(dim=1).detach().cpu().tolist())
-        # image_label.extend(y.detach().cpu().tolist())
-
-    # assert len(predict) == len(image_label)
-    # acc = accuracy_score(image_label, predict)
+# 用了fit loss 就可以下降 - 很奇怪
+def fit(epoch, model, trainloader, testloader):
     
-    # 每个Epoch损失平均值
-    Loss.append(np.mean(np.array(train_loss)))
-    print('Epoch:', epoch, 'Model Loss:', Loss[-1], 'Accuracy: ', 0)
+    running_loss = 0 #当前丢失数 - 这个也做叠加懵，逻辑是把所有的丢失率统计起来 -叠加方式    
+    
+    model.train() #训练模式 - 因为使用了Dropout，训练与测试导致不预测差别太大，不太真实所以训练用model.train()，预测用model.eval()
+    for x,y in trainloader:
+        
+        # 运行设备
+        x=x.to(device)
+        y=y.to(device)  
+
+        y_pred = model(x)#预测结果
+        
+        loss = loss_fn(y_pred, y)    #预测值，真实值          
+        opt.zero_grad() #默认梯度为0
+        loss.backward() #损失反向传播放   
+        opt.step()      #优化模型
+
+        #打印预测结构，因为不需要运算，所以要放到with中，这个是在for中的，提别要注意这一点        
+        with torch.no_grad():
+            running_loss += loss.item() #当前丢失数
+
+    #记录速衰减-步数统计
+    exp_lr_scheduler.step()
+
+    #丢失率=当前累加丢失数/总长度 
+    epoch_loss = running_loss / len(trainloader.dataset)
+        
+        
+    ##################################
+    test_running_loss = 0     
+    model.eval()
+    with torch.no_grad():
+        for x,y in testloader:
+            
+            x=x.to(device)
+            y=y.to(device) 
+
+            y_pred = model(x)
+
+            loss = loss_fn(y_pred, y)#预测值，真实值         
+            test_running_loss += loss.item()#当前丢失数
+            
+    epoch_test_loss = test_running_loss / len(testloader.dataset)
+    
+        
+    print('epoch: ', epoch, 'loss： ', round(epoch_loss, 10),  'test_loss： ', round(epoch_test_loss, 10),   )
+
+    return epoch_loss, epoch_test_loss
+
+
+# 
+train_loss = []
+test_loss = []
+
+for epoch in range(epochs):
+    epoch_loss, epoch_test_loss = fit(epoch, model, trainRow, validRow)
+    train_loss.append(epoch_loss)
+    test_loss.append(epoch_test_loss)
 
     # 模型保存
     torch.save(model.state_dict(), './output.pth', _use_new_zipfile_serialization=False)
 
-import matplotlib.pyplot as plt
-plt.title('The Train Loss of Vision Transformer')
-plt.plot(range(len(Loss)), Loss, label='Loss')
+# 打印loss
+plt.figure()
+plt.plot(range(1, len(train_loss)+1), train_loss, 'r', label='Training loss')
+plt.plot(range(1, len(train_loss)+1), test_loss, 'bo', label='Validation loss')
+plt.title('Training and Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss Value')
 plt.legend()
 plt.show()
-
-
-# # 预测 
-# vit = VIT(image_height=128, image_width=128, in_channels=3, patch_height=16, patch_width=16, dim=64, n_head=8, p=0.1, n_layers=5, num_class=6)
-# vit.load_state_dict(torch.load(r'./Model/vit.pth'))
-
-# from sklearn.metrics import accuracy_score
-
-# def test(path):
-#     predict = []
-#     label = []
-    
-#     # 导入测试数据
-#     with open(r'./test_loader.pth', 'rb') as f: 
-#         test_image = dill.load(f)
-#         for image_item, label_item in test_image:
-#             output = vit(image_item)
-#             predict.append(output.argmax(dim=1).detach().cpu().item())
-#             label.append(label_item.item())
-        
-#     print('测试数据：', len(label))
-#     print('Accuracy:', accuracy_score(label, predict))
-
-
-
